@@ -214,6 +214,15 @@ class Autoencoder(keras.Model):
         """
         return self.decoder(z, training=False)
 
+    def get_config(self) -> dict:
+        """Return model config for serialization."""
+        return {"latent_dim": self.latent_dim}
+
+    @classmethod
+    def from_config(cls, config: dict) -> "Autoencoder":
+        """Reconstruct model from config."""
+        return cls(**config)
+
 
 # ---------------------------------------------------------------------------
 # VAE Encoder (outputs mu and log_var)
@@ -396,3 +405,12 @@ class VAE(keras.Model):
         """
         z = tf.random.normal(shape=(n_samples, self.latent_dim))
         return self.decode(z)
+
+    def get_config(self) -> dict:
+        """Return model config for serialization."""
+        return {"latent_dim": self.latent_dim}
+
+    @classmethod
+    def from_config(cls, config: dict) -> "VAE":
+        """Reconstruct model from config."""
+        return cls(**config)

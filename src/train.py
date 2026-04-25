@@ -86,42 +86,54 @@ def vae_loss(
     reconstructed: tf.Tensor,
     mu: tf.Tensor,
     log_var: tf.Tensor,
+    kl_weight: float = 1.0,
 ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
     """
-    Compute the VAE loss: reconstruction loss + KL divergence.
+    Compute the VAE loss: reconstruction loss + weighted KL divergence.
 
-    Total loss = MSE + beta * KL
+    Uses Binary Cross-Entropy for reconstruction loss because it
+    produces values on a scale compatible with KL divergence,
+    preventing KL collapse — a failure mode where the KL term is
+    overwhelmed by reconstruction loss and the encoder learns no
+    meaningful latent distribution.
 
-    KL divergence measures how far the learned latent distribution
-    N(mu, var) is from the prior N(0, I). Minimizing KL regularizes
-    the latent space so it stays close to a standard normal, which
-    is what allows meaningful sampling during generation.
+    MSE produces values ~0.008 while KL produces ~0.0001, making
+    them impossible to balance. BCE produces values ~0.1-0.3 which
+    are naturally on the same scale as KL.
 
-    KL formula (closed form for Gaussian):
-        KL = -0.5 * sum(1 + log_var - mu^2 - exp(log_var))
-
-    We use beta=1 (standard VAE). Increasing beta would give a
-    more disentangled but less sharp latent space.
+    Total loss = BCE + kl_weight * KL
 
     Args:
         original:      Original image batch, shape (B, H, W, C).
         reconstructed: Reconstructed image batch, shape (B, H, W, C).
         mu:            Latent mean, shape (B, latent_dim).
         log_var:       Latent log variance, shape (B, latent_dim).
+        kl_weight:     Weight applied to KL term (increases during warmup).
 
     Returns:
         Tuple of (total_loss, reconstruction_loss, kl_loss) — all scalars.
     """
+    # Clip to avoid log(0)
+    reconstructed = tf.clip_by_value(reconstructed, 1e-7, 1.0 - 1e-7)
+
+    # Binary cross-entropy reconstruction loss
     reconstruction_loss = tf.reduce_mean(
-        tf.square(original - reconstructed)
+        tf.reduce_sum(
+            -original * tf.math.log(reconstructed)
+            - (1.0 - original) * tf.math.log(1.0 - reconstructed),
+            axis=[1, 2, 3],  # sum over pixels, mean over batch
+        )
     )
 
     # KL divergence — averaged over batch and latent dimensions
     kl_loss = -0.5 * tf.reduce_mean(
-        1 + log_var - tf.square(mu) - tf.exp(log_var)
+        tf.reduce_sum(
+            1 + log_var - tf.square(mu) - tf.exp(log_var),
+            axis=1,  # sum over latent dims, mean over batch
+        )
     )
 
-    total_loss = reconstruction_loss + kl_loss
+    total_loss = reconstruction_loss + kl_weight * kl_loss
 
     return total_loss, reconstruction_loss, kl_loss
 
@@ -131,7 +143,6 @@ def vae_loss(
 # ---------------------------------------------------------------------------
 
 
-@tf.function
 def ae_train_step(
     model: Autoencoder,
     batch: tf.Tensor,
@@ -157,26 +168,29 @@ def ae_train_step(
     return loss
 
 
-@tf.function
 def vae_train_step(
     model: VAE,
     batch: tf.Tensor,
     optimizer: tf.keras.optimizers.Optimizer,
+    kl_weight: float = 1.0,
 ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
     """
     Perform one VAE training step using GradientTape.
 
     Args:
-        model:     The VAE model.
-        batch:     Image batch tensor of shape (B, 64, 64, 1).
-        optimizer: Keras optimizer instance.
+        model:      The VAE model.
+        batch:      Image batch tensor of shape (B, 64, 64, 1).
+        optimizer:  Keras optimizer instance.
+        kl_weight:  Current KL weight (for warm-up scheduling).
 
     Returns:
         Tuple of (total_loss, reconstruction_loss, kl_loss).
     """
     with tf.GradientTape() as tape:
         reconstructed, mu, log_var = model(batch, training=True)
-        total, recon, kl = vae_loss(batch, reconstructed, mu, log_var)
+        total, recon, kl = vae_loss(
+            batch, reconstructed, mu, log_var, kl_weight
+        )
 
     gradients = tape.gradient(total, model.trainable_variables)
     optimizer.apply_gradients(zip(gradients, model.trainable_variables))
@@ -275,13 +289,22 @@ def train_vae_for_region(
         "train_kl_loss": [],
     }
 
+    # KL warm-up: linearly increase kl_weight from 0 to 1 over
+    # the first half of training, then hold at 1.
+    warmup_epochs = max(1, epochs // 2)
+
     for epoch in range(epochs):
         start = time.time()
+
+        # Compute current KL weight (warm-up schedule)
+        kl_weight = min(1.0, (epoch + 1) / warmup_epochs)
 
         # --- Training ---
         train_totals, train_recons, train_kls = [], [], []
         for batch in datasets["train"]:
-            total, recon, kl = vae_train_step(model, batch, optimizer)
+            total, recon, kl = vae_train_step(
+                model, batch, optimizer, kl_weight
+            )
             train_totals.append(float(total))
             train_recons.append(float(recon))
             train_kls.append(float(kl))
@@ -306,10 +329,11 @@ def train_vae_for_region(
         elapsed = time.time() - start
         print(
             f"    Epoch {epoch + 1:02d}/{epochs} — "
-            f"train: {train_loss:.4f} — "
-            f"val: {val_loss:.4f} — "
-            f"recon: {train_recon:.4f} — "
+            f"train: {train_loss:.2f} — "
+            f"val: {val_loss:.2f} — "
+            f"recon: {train_recon:.2f} — "
             f"kl: {train_kl:.4f} — "
+            f"kl_weight: {kl_weight:.2f} — "
             f"{elapsed:.1f}s"
         )
 
